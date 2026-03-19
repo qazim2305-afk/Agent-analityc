@@ -1,14 +1,14 @@
 """
-Pydantic models — përcakton strukturën e të dhënave.
-Çdo request dhe response kalon nëpër këto modele.
+Pydantic models — struktura e të dhënave që Orientim SDK dërgon.
+Sinkronizuar me app/api/ingest/run/route.ts (Vercel).
 """
 from pydantic import BaseModel, Field, validator
-from typing   import Optional, Dict, Any
+from typing   import Optional, Dict, Any, Literal
 from datetime import datetime
 from enum     import Enum
 
 
-# ── Enums ──────────────────────────────────────────────────────────────────
+# ── Enums ──────────────────────────────────────────────────────────────────────
 class AlertSeverity(str, Enum):
     LOW      = "low"
     MEDIUM   = "medium"
@@ -24,36 +24,59 @@ class AlertType(str, Enum):
     ANOMALY         = "anomaly_detected"
 
 
-# ── Webhook Event (vjen nga SDK) ───────────────────────────────────────────
+class RunStatus(str, Enum):
+    SUCCESS = "success"
+    ERROR   = "error"
+    TIMEOUT = "timeout"
+    RUNNING = "running"
+
+
+class ErrorType(str, Enum):
+    TIMEOUT        = "timeout"
+    RATE_LIMIT     = "rate_limit"
+    INVALID_OUTPUT = "invalid_output"
+    TOOL_FAILURE   = "tool_failure"
+
+
+# ── WebhookEvent — sinkronizuar me ingest/run/route.ts ─────────────────────────
 class WebhookEvent(BaseModel):
     """
-    Ky është payload-i që SDK dërgon tek ne.
-    Çdo field është saktësisht si e kemi dizajnuar në SDK.
+    Payload nga SDK → POST /webhooks/events
+    Fusha identike me TrackRunPayload në ingest/run/route.ts
     """
-    agentId:       str   = Field(..., example="email-bot-1")
-    success:       bool  = Field(..., example=True)
-    latency:       float = Field(..., gt=0, example=1200.0)
-    cost:          float = Field(0.0,  ge=0, example=0.05)
-    errorMessage:  Optional[str]  = None
-    errorType:     Optional[str]  = None
-    taskType:      Optional[str]  = None
-    tokensInput:   Optional[int]  = None
-    tokensOutput:  Optional[int]  = None
-    userRating:    Optional[int]  = Field(None, ge=1, le=5)
-    metadata:      Dict[str, Any] = Field(default_factory=dict)
-    eventId:       str            = Field(..., example="uuid-here")
-    timestamp:     str            = Field(..., example="2026-03-14T10:00:00Z")
-    sdkVersion:    str            = Field("1.0.0")
+    # Required
+    agent_name:    str         = Field(...,    alias="agentName",  example="invoice-processor")
+    status:        RunStatus   = Field(...,    example="success")
 
-    @validator("cost", pre=True, always=True)
+    # Optional metrics
+    latency_ms:    Optional[float] = Field(None, alias="latencyMs",    ge=0)
+    input_tokens:  Optional[int]   = Field(None, alias="inputTokens",  ge=0)
+    output_tokens: Optional[int]   = Field(None, alias="outputTokens", ge=0)
+    cost_usd:      Optional[float] = Field(None, alias="costUsd",      ge=0)
+
+    # Optional error info
+    error_message: Optional[str]       = Field(None, alias="errorMessage")
+    error_type:    Optional[ErrorType] = Field(None, alias="errorType")
+
+    # Optional trace/session
+    trace_id:   Optional[str] = Field(None, alias="traceId")
+    session_id: Optional[str] = Field(None, alias="sessionId")
+
+    # Optional metadata & timestamps
+    metadata:   Dict[str, Any] = Field(default_factory=dict)
+    started_at: Optional[str]  = Field(None, alias="startedAt")
+    ended_at:   Optional[str]  = Field(None, alias="endedAt")
+    timestamp:  Optional[str]  = None
+
+    class Config:
+        populate_by_name = True   # pranon si 'agentName' edhe 'agent_name'
+
+    @validator("cost_usd", pre=True, always=True)
     def auto_calculate_cost(cls, v, values):
-        """
-        Nëse cost është 0 por kemi tokens,
-        kalkulojmë cost automatikisht.
-        """
-        if v == 0.0:
-            tokens_in  = values.get("tokensInput",  0) or 0
-            tokens_out = values.get("tokensOutput", 0) or 0
+        """Nëse cost_usd është 0 ose None por ka tokens, kalkulon automatikisht."""
+        if not v:
+            tokens_in  = values.get("input_tokens",  0) or 0
+            tokens_out = values.get("output_tokens", 0) or 0
             if tokens_in > 0 or tokens_out > 0:
                 return round(
                     (tokens_in  / 1_000_000 * 5.0) +
@@ -63,35 +86,30 @@ class WebhookEvent(BaseModel):
         return v
 
 
-# ── Agent Create ───────────────────────────────────────────────────────────
-class AgentCreate(BaseModel):
-    name:       str            = Field(..., example="Email Bot")
-    modelUsed:  Optional[str]  = Field(None, example="gpt-4o")
-    tags:       list           = Field(default_factory=list)
+# ── Webhook Response ────────────────────────────────────────────────────────────
+class WebhookResponse(BaseModel):
+    status:   str
+    message:  str
+    agent_id: str
+    run_id:   Optional[str] = None
 
 
-# ── Analytics Response ─────────────────────────────────────────────────────
+# ── Analytics Response ──────────────────────────────────────────────────────────
 class AnalyticsResponse(BaseModel):
-    agentId:          str
-    totalTasks:       int
-    successRate:      float
-    avgLatencyMs:     float
-    avgCostPerTask:   float
-    totalCostUsd:     float
-    anomalies:        list
-    errorClusters:    list
-    costForecast:     list
-    recommendations:  list
-    alerts:           list
+    agent_id:        str
+    stats:           Dict[str, Any]
+    anomalies:       list
+    error_clusters:  list
+    recommendations: list
 
 
-# ── Alert Model ────────────────────────────────────────────────────────────
+# ── Alert Model ─────────────────────────────────────────────────────────────────
 class AlertCreate(BaseModel):
-    agentId:     str
-    customerId:  str
-    alertType:   AlertType
-    severity:    AlertSeverity
-    title:       str
-    message:     str
-    metricValue: Optional[float] = None
-    threshold:   Optional[float] = None
+    agent_id:     str
+    org_id:       str
+    alert_type:   AlertType
+    severity:     AlertSeverity
+    title:        str
+    message:      str
+    metric_value: Optional[float] = None
+    threshold:    Optional[float] = None
