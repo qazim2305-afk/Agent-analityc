@@ -1,343 +1,259 @@
+ML Analytics Engine — statistika, anomali, klasterizim gabimesh,
+parashikim kostoje dhe rekomandime AI.
+Tabela: agent_runs (jo metrics)
 """
-ML Analytics Engine — 5 algoritmet kryesore.
-Isolation Forest, K-Means, AutoARIMA, 
-Cost Optimizer, dhe Stats bazike.
-"""
-from sklearn.ensemble    import IsolationForest
-from sklearn.cluster     import KMeans
-from sklearn.preprocessing import StandardScaler
-import pandas            as pd
-import numpy             as np
-from database            import get_db
+from __future__ import annotations
+import numpy  as np
+import pandas as pd
+from datetime import datetime, timezone, timedelta
+from typing   import Any
+
+from database import get_db
+
+# ─── helpers ──────────────────────────────────────────────────────────────────
+
+def _empty_stats() -> dict:
+    return {
+        "total_tasks": 0, "success_rate": 0.0,
+        "avg_latency_ms": 0.0, "p95_latency_ms": 0.0,
+        "avg_cost_usd": 0.0, "total_cost_usd": 0.0,
+        "cost_per_success": 0.0,
+    }
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# 1. STATS BAZIKE — Success Rate, Cost, Latency
-# ══════════════════════════════════════════════════════════════════════════
+# ─── 1. Basic stats ───────────────────────────────────────────────────────────
+
 def get_basic_stats(agent_id: str) -> dict:
-    """
-    Kalkulon statistika bazike për një agent.
-    E shpejtë, e thjeshtë, gjithmonë e disponueshme.
-    """
-    db     = get_db()
-    result = (
-        db.table("metrics")
-        .select("success, latency_ms, cost_usd, tokens_input, tokens_output")
+    """Statistika bazë nga 1 000 run-et e fundit të agent_runs."""
+    db  = get_db()
+    res = (
+        db.table("agent_runs")
+        .select("status, latency_ms, cost_usd")
         .eq("agent_id", agent_id)
-        .order("timestamp", desc=True)
+        .order("created_at", desc=True)
         .limit(1000)
         .execute()
     )
+    rows = res.data or []
+    if not rows:
+        return _empty_stats()
 
-    if not result.data:
-        return _empty_stats(agent_id)
+    total        = len(rows)
+    successes    = sum(1 for r in rows if r.get("status") == "success")
+    latencies    = [r["latency_ms"] for r in rows if r.get("latency_ms") is not None]
+    costs        = [r["cost_usd"]   for r in rows if r.get("cost_usd")   is not None]
 
-    df = pd.DataFrame(result.data)
-
-    total_tasks    = len(df)
-    success_rate   = df["success"].mean()
-    avg_latency    = df["latency_ms"].mean()
-    p95_latency    = df["latency_ms"].quantile(0.95)
-    avg_cost       = df["cost_usd"].mean()
-    total_cost     = df["cost_usd"].sum()
-
-    # Cost per successful task
-    successful     = df[df["success"] == True]
-    cost_per_win   = (
-        successful["cost_usd"].mean()
-        if len(successful) > 0 else 0.0
-    )
+    success_rate    = successes / total
+    avg_latency     = float(np.mean(latencies))  if latencies else 0.0
+    p95_latency     = float(np.percentile(latencies, 95)) if latencies else 0.0
+    avg_cost        = float(np.mean(costs))  if costs else 0.0
+    total_cost      = float(np.sum(costs))   if costs else 0.0
+    cost_per_succ   = total_cost / successes if successes else 0.0
 
     return {
-        "agentId":         agent_id,
-        "totalTasks":      total_tasks,
-        "successRate":     round(float(success_rate),  4),
-        "avgLatencyMs":    round(float(avg_latency),   2),
-        "p95LatencyMs":    round(float(p95_latency),   2),
-        "avgCostPerTask":  round(float(avg_cost),      6),
-        "totalCostUsd":    round(float(total_cost),    4),
-        "costPerSuccess":  round(float(cost_per_win),  6),
+        "total_tasks":      total,
+        "success_rate":     round(success_rate, 4),
+        "avg_latency_ms":   round(avg_latency,  2),
+        "p95_latency_ms":   round(p95_latency,  2),
+        "avg_cost_usd":     round(avg_cost,      6),
+        "total_cost_usd":   round(total_cost,    6),
+        "cost_per_success": round(cost_per_succ, 6),
     }
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# 2. ANOMALY DETECTION — Isolation Forest
-# ══════════════════════════════════════════════════════════════════════════
-def detect_anomalies(agent_id: str) -> list:
+# ─── 2. Anomaly detection ─────────────────────────────────────────────────────
+
+def detect_anomalies(agent_id: str) -> list[dict]:
     """
-    Isolation Forest — detekton kur cost/latency
-    hyjnë jashtë normales.
-    
-    Returns: lista e anomalive të detektuara
+    Isolation Forest mbi 500 run-et e fundit.
+    Klasifikon: cost_spike, latency_spike, combined.
     """
-    db     = get_db()
-    result = (
-        db.table("metrics")
-        .select("id, timestamp, cost_usd, latency_ms, success")
+    from sklearn.ensemble import IsolationForest
+
+    db  = get_db()
+    res = (
+        db.table("agent_runs")
+        .select("id, cost_usd, latency_ms, created_at")
         .eq("agent_id", agent_id)
-        .order("timestamp", desc=True)
+        .order("created_at", desc=True)
         .limit(500)
         .execute()
     )
+    rows = [r for r in (res.data or [])
+            if r.get("cost_usd") is not None and r.get("latency_ms") is not None]
 
-    if not result.data or len(result.data) < 20:
-        return []   # Jo mjaftueshëm të dhëna
+    if len(rows) < 20:
+        return []
 
-    df = pd.DataFrame(result.data)
+    X   = np.array([[r["cost_usd"], r["latency_ms"]] for r in rows])
+    clf = IsolationForest(contamination=0.05, n_estimators=100,
+                          random_state=42, n_jobs=-1)
+    preds = clf.fit_predict(X)          # -1 = anomaly
 
-    # Features për Isolation Forest
-    features   = df[["cost_usd", "latency_ms"]].fillna(0)
-    scaler     = StandardScaler()
-    scaled     = scaler.fit_transform(features)
+    anomalies = []
+    mean_cost    = float(np.mean(X[:, 0]))
+    mean_latency = float(np.mean(X[:, 1]))
 
-    # Train Isolation Forest
-    model      = IsolationForest(
-        contamination = 0.05,    # 5% të dhëna anomale
-        n_estimators  = 100,
-        random_state  = 42
-    )
-    predictions = model.fit_predict(scaled)
-
-    # Gjej anomalitë (-1 = anomali)
-    anomalies  = []
-    for i, pred in enumerate(predictions):
+    for i, (pred, row) in enumerate(zip(preds, rows)):
         if pred == -1:
+            cost_spike    = row["cost_usd"]    > mean_cost    * 2
+            latency_spike = row["latency_ms"]  > mean_latency * 2
+            kind = ("combined"      if cost_spike and latency_spike
+                    else "cost_spike"    if cost_spike
+                    else "latency_spike")
             anomalies.append({
-                "timestamp":  df.iloc[i]["timestamp"],
-                "costUsd":    df.iloc[i]["cost_usd"],
-                "latencyMs":  df.iloc[i]["latency_ms"],
-                "type":       _classify_anomaly(
-                    df.iloc[i]["cost_usd"],
-                    df.iloc[i]["latency_ms"],
-                    df["cost_usd"].mean(),
-                    df["latency_ms"].mean()
-                )
+                "run_id":     row["id"],
+                "type":       kind,
+                "cost_usd":   round(row["cost_usd"],   6),
+                "latency_ms": round(row["latency_ms"],  1),
+                "created_at": row["created_at"],
             })
 
-    return anomalies[:10]   # Kthe 10 anomalitë e fundit
+    return anomalies[-10:]   # 10 më të fundit
 
 
-def _classify_anomaly(cost, latency, avg_cost, avg_latency) -> str:
-    """Klasifiko llojin e anomalisë."""
-    if cost > avg_cost * 3:
-        return "cost_spike"
-    elif latency > avg_latency * 3:
-        return "latency_spike"
-    else:
-        return "combined_anomaly"
+# ─── 3. Error clustering ──────────────────────────────────────────────────────
 
-
-# ══════════════════════════════════════════════════════════════════════════
-# 3. ERROR CLUSTERING — K-Means
-# ══════════════════════════════════════════════════════════════════════════
-def cluster_errors(agent_id: str) -> list:
-    """
-    K-Means — grupo gabimet sipas ngjashmërisë.
-    Gjen root cause patterns automatikisht.
-    
-    Returns: lista e cluster-ave me gabime
-    """
-    db     = get_db()
-    result = (
-        db.table("metrics")
-        .select("error_type, error_message, cost_usd, latency_ms")
+def cluster_errors(agent_id: str) -> list[dict]:
+    """Grupim gabimesh sipas error_type."""
+    db  = get_db()
+    res = (
+        db.table("agent_runs")
+        .select("error_type, cost_usd, latency_ms")
         .eq("agent_id", agent_id)
-        .eq("success",  False)
-        .order("timestamp", desc=True)
-        .limit(500)
+        .eq("status", "error")          # ← status='error' (jo success=False)
+        .order("created_at", desc=True)
+        .limit(1000)
         .execute()
     )
-
-    if not result.data or len(result.data) < 5:
+    rows = res.data or []
+    if len(rows) < 5:
         return []
 
-    df         = pd.DataFrame(result.data)
+    df = pd.DataFrame(rows)
+    df["error_type"].fillna("unknown", inplace=True)
 
-    # Grupo sipas error_type (i thjeshtë dhe efektiv)
-    if "error_type" in df.columns and df["error_type"].notna().any():
-        clusters = (
-            df.groupby("error_type")
-            .agg(
-                count        = ("error_type",  "count"),
-                avg_cost     = ("cost_usd",    "mean"),
-                avg_latency  = ("latency_ms",  "mean"),
-            )
-            .reset_index()
-            .sort_values("count", ascending=False)
-        )
+    total = len(df)
+    result = []
+    for etype, grp in df.groupby("error_type"):
+        result.append({
+            "error_type":   etype,
+            "count":        len(grp),
+            "percentage":   round(len(grp) / total * 100, 1),
+            "avg_cost_usd": round(grp["cost_usd"].mean(),   6) if "cost_usd"   in grp else 0,
+            "avg_latency":  round(grp["latency_ms"].mean(), 1) if "latency_ms" in grp else 0,
+        })
 
-        return [
-            {
-                "errorType":   row["error_type"],
-                "count":       int(row["count"]),
-                "avgCost":     round(float(row["avg_cost"]),    6),
-                "avgLatency":  round(float(row["avg_latency"]), 2),
-                "percentage":  round(row["count"] / len(df) * 100, 1)
-            }
-            for _, row in clusters.iterrows()
-        ]
-
-    return []
+    return sorted(result, key=lambda x: x["count"], reverse=True)
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# 4. COST FORECASTING — AutoARIMA
-# ══════════════════════════════════════════════════════════════════════════
-def forecast_costs(agent_id: str, days: int = 30) -> list:
+# ─── 4. Cost forecasting ──────────────────────────────────────────────────────
+
+def forecast_costs(agent_id: str, days: int = 30) -> list[dict]:
     """
-    AutoARIMA — parashiko kostot e muajit të ardhshëm.
-    
-    Returns: lista me (date, predicted_cost) për 30 ditë
+    AutoARIMA mbi 30 ditët e fundit (min 14 pikë).
+    Fallback: mesatare e 7 ditëve.
     """
-    db     = get_db()
-    result = (
-        db.table("metrics")
-        .select("timestamp, cost_usd")
+    db  = get_db()
+    since = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
+    res = (
+        db.table("agent_runs")
+        .select("cost_usd, created_at")
         .eq("agent_id", agent_id)
-        .order("timestamp", desc=False)
+        .gte("created_at", since)
+        .order("created_at")
         .execute()
     )
-
-    if not result.data or len(result.data) < 14:
-        return []   # Duhen të paktën 14 ditë të dhëna
-
-    df              = pd.DataFrame(result.data)
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
-    df              = df.set_index("timestamp")
-
-    # Agrrego koston ditore
-    daily_cost      = df["cost_usd"].resample("D").sum().fillna(0)
-
-    if len(daily_cost) < 7:
+    rows = res.data or []
+    if not rows:
         return []
 
-    try:
-        from pmdarima import auto_arima
+    df = pd.DataFrame(rows)
+    df["date"]     = pd.to_datetime(df["created_at"]).dt.date
+    daily          = df.groupby("date")["cost_usd"].sum().reset_index()
+    daily.columns  = ["date", "cost"]
 
-        model       = auto_arima(
-            daily_cost,
-            seasonal    = False,
-            stepwise    = True,
-            suppress_warnings = True,
-            error_action      = "ignore",
-        )
-        forecast    = model.predict(n_periods=days)
-
-        # Gjenero datat e ardhshme
-        last_date   = daily_cost.index[-1]
-        future_dates = pd.date_range(
-            start   = last_date + pd.Timedelta(days=1),
-            periods = days,
-            freq    = "D"
-        )
-
-        return [
-            {
-                "date":          str(date.date()),
-                "predictedCost": round(max(0, float(cost)), 4)
-            }
-            for date, cost in zip(future_dates, forecast)
-        ]
-
-    except Exception:
-        # Fallback: trend i thjeshtë linear
-        return _simple_forecast(daily_cost, days)
-
-
-def _simple_forecast(daily_cost: pd.Series, days: int) -> list:
-    """Fallback forecast nëse AutoARIMA dështon."""
-    avg_cost    = daily_cost.tail(7).mean()
-    last_date   = daily_cost.index[-1]
-
-    return [
-        {
-            "date":          str((last_date + pd.Timedelta(days=i+1)).date()),
-            "predictedCost": round(float(avg_cost), 4)
-        }
+    future_dates = [
+        (datetime.now(timezone.utc).date() + timedelta(days=i+1)).isoformat()
         for i in range(days)
     ]
 
+    if len(daily) >= 14:
+        try:
+            from pmdarima import auto_arima
+            model    = auto_arima(daily["cost"].values, seasonal=False,
+                                  suppress_warnings=True, error_action="ignore",
+                                  max_p=3, max_q=3)
+            forecast = model.predict(n_periods=days)
+            return [
+                {"date": d, "predicted_cost_usd": round(max(float(v), 0), 6)}
+                for d, v in zip(future_dates, forecast)
+            ]
+        except Exception:
+            pass   # fallback
 
-# ══════════════════════════════════════════════════════════════════════════
-# 5. COST OPTIMIZER — Heuristic Recommendations
-# ══════════════════════════════════════════════════════════════════════════
-def get_recommendations(agent_id: str) -> list:
-    """
-    Analizon performance dhe jep rekomandime konkrete
-    për të ulur kostot.
-    
-    Returns: lista e rekomandimeve me estimated savings
-    """
-    stats           = get_basic_stats(agent_id)
-    recommendations = []
+    # Fallback: 7-day rolling average
+    avg = float(daily["cost"].tail(7).mean()) if len(daily) >= 7 else float(daily["cost"].mean())
+    return [{"date": d, "predicted_cost_usd": round(avg, 6)} for d in future_dates]
 
-    # ── Rec 1: Model Downgrade ─────────────────────────────────────────────
-    if stats["avgCostPerTask"] > 0.05:
-        savings = stats["avgCostPerTask"] * 0.7 * stats["totalTasks"]
-        recommendations.append({
-            "type":           "model_downgrade",
-            "title":          "🔄 Përdor model më të lirë",
-            "description":    (
-                f"Cost mesatar ${stats['avgCostPerTask']:.4f}/task është i lartë. "
-                f"Kalimi tek GPT-4o-mini mund të kursejë ~70% kosto."
-            ),
-            "estimatedSaving": round(savings, 2),
-            "priority":       "high"
+
+# ─── 5. Cost optimizer ────────────────────────────────────────────────────────
+
+def get_cost_recommendations(agent_id: str) -> list[dict]:
+    """Rekomandime konkrete bazuar mbi statistika."""
+    stats = get_basic_stats(agent_id)
+    recs  : list[dict] = []
+
+    cost_per_task = stats.get("avg_cost_usd", 0.0)
+    success_rate  = stats.get("success_rate",  0.0)
+    total_tasks   = stats.get("total_tasks",   0)
+    avg_latency   = stats.get("avg_latency_ms", 0.0)
+    total_cost    = stats.get("total_cost_usd", 0.0)
+
+    # 1) Model downgrade
+    if cost_per_task > 0.05:
+        recs.append({
+            "type":            "model_downgrade",
+            "priority":        "high",
+            "title":           "Switch to a cheaper model",
+            "description":     f"Avg cost/task is ${cost_per_task:.4f}. "
+                               "A smaller model could cut costs ~70 %.",
+            "estimated_savings": f"~${total_cost * 0.70:.2f}",
         })
 
-    # ── Rec 2: Caching ────────────────────────────────────────────────────
-    if stats["successRate"] > 0.9 and stats["totalTasks"] > 100:
-        savings = stats["avgCostPerTask"] * 0.3 * stats["totalTasks"]
-        recommendations.append({
-            "type":           "caching",
-            "title":          "⚡ Implemento Response Caching",
-            "description":    (
-                f"Me {stats['successRate']:.0%} success rate, "
-                f"caching i response-ave të njëjta mund të kursejë 20-30%."
-            ),
-            "estimatedSaving": round(savings, 2),
-            "priority":       "medium"
+    # 2) Caching
+    if success_rate > 0.90 and total_tasks > 100:
+        recs.append({
+            "type":            "enable_caching",
+            "priority":        "medium",
+            "title":           "Enable response caching",
+            "description":     f"Success rate {success_rate*100:.1f}% and "
+                               f"{total_tasks} tasks suggest high repeatability. "
+                               "Caching may cut calls 20-30 %.",
+            "estimated_savings": f"~${total_cost * 0.25:.2f}",
         })
 
-    # ── Rec 3: Latency Optimization ───────────────────────────────────────
-    if stats["avgLatencyMs"] > 3000:
-        recommendations.append({
-            "type":           "latency",
-            "title":          "⏱️ Optimizo Latency",
-            "description":    (
-                f"Latency mesatare {stats['avgLatencyMs']:.0f}ms është e lartë. "
-                f"Shqyrto streaming responses ose prompt shortening."
-            ),
-            "estimatedSaving": 0.0,
-            "priority":       "medium"
+    # 3) Latency
+    if avg_latency > 3000:
+        recs.append({
+            "type":            "latency_optimization",
+            "priority":        "medium",
+            "title":           "Reduce agent latency",
+            "description":     f"Avg latency {avg_latency:.0f} ms exceeds 3 s. "
+                               "Consider streaming or prompt compression.",
+            "estimated_savings": None,
         })
 
-    # ── Rec 4: Error Investigation ────────────────────────────────────────
-    if stats["successRate"] < 0.85:
-        waste = (1 - stats["successRate"]) * stats["totalCostUsd"]
-        recommendations.append({
-            "type":           "error_reduction",
-            "title":          "🔴 Redukto Gabimet",
-            "description":    (
-                f"Me {1-stats['successRate']:.0%} error rate, "
-                f"po humbet ${waste:.2f} në tasks të dështuara."
-            ),
-            "estimatedSaving": round(waste * 0.7, 2),
-            "priority":       "high"
+    # 4) Error reduction
+    if success_rate < 0.85:
+        wasted = total_cost * (1 - success_rate)
+        recs.append({
+            "type":            "error_reduction",
+            "priority":        "high",
+            "title":           "Reduce error rate",
+            "description":     f"Success rate {success_rate*100:.1f}% wastes "
+                               f"~${wasted:.2f}. Fixing top errors could save ~70 %.",
+            "estimated_savings": f"~${wasted * 0.70:.2f}",
         })
 
-    return recommendations
-
-
-# ── Helper ─────────────────────────────────────────────────────────────────
-def _empty_stats(agent_id: str) -> dict:
-    return {
-        "agentId":        agent_id,
-        "totalTasks":     0,
-        "successRate":    0.0,
-        "avgLatencyMs":   0.0,
-        "p95LatencyMs":   0.0,
-        "avgCostPerTask": 0.0,
-        "totalCostUsd":   0.0,
-        "costPerSuccess": 0.0,
-    }
+    return recs
