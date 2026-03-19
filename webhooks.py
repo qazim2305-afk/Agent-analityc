@@ -1,137 +1,138 @@
 """
-Webhook receiver — merr events nga SDK.
-Ky është endpoint-i kryesor: POST /webhooks/events
+Webhook receiver — merr events nga SDK dhe i ruan në Supabase.
+Tabela: organizations, api_keys, agents, agent_runs
 """
-from fastapi    import APIRouter, Header, HTTPException, Depends
-from database   import get_db
-from models     import WebhookEvent
-from alerts     import check_and_create_alerts
+from fastapi import APIRouter, HTTPException, Header
+from typing import Optional
 import hashlib
+import asyncio
+from datetime import datetime, timezone
+
+from database import get_db
+from models import WebhookEvent, WebhookResponse
+from alerts import check_and_create_alerts
 
 router = APIRouter()
 
 
-# ── API Key Validation ─────────────────────────────────────────────────────
-async def validate_api_key(
-    authorization: str = Header(..., example="Bearer ck_live_xxxx")
-) -> dict:
+def _hash_key(raw_key: str) -> str:
+    """SHA-256 hash i API key."""
+    return hashlib.sha256(raw_key.encode()).hexdigest()
+
+
+async def _validate_api_key(raw_key: str) -> dict:
     """
-    Validon API key nga header.
-    Çdo request nga SDK duhet të ketë këtë header.
+    Valido API key dhe kthe org_id.
+    Kërkon në tabelën api_keys kolonën key_hash.
     """
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(
-            status_code=401,
-            detail="❌ Format i gabuar. Përdor: Bearer ck_live_xxxx"
-        )
+    db = get_db()
+    key_hash = _hash_key(raw_key)
 
-    api_key = authorization.replace("Bearer ", "").strip()
-
-    # Hash the key dhe kërko në Supabase
-    key_hash = hashlib.sha256(api_key.encode()).hexdigest()
-
-    db       = get_db()
-    result   = (
-        db.table("customers")
-        .select("id, company, plan")
-        .eq("api_key_hash", key_hash)
+    result = (
+        db.table("api_keys")
+        .select("id, org_id, is_active, name")
+        .eq("key_hash", key_hash)
+        .eq("is_active", True)
+        .single()
         .execute()
     )
 
     if not result.data:
-        raise HTTPException(
-            status_code=401,
-            detail="❌ API key i pavlefshëm"
-        )
+        raise HTTPException(status_code=401, detail="Invalid or inactive API key")
 
-    return result.data[0]   # {"id": "...", "company": "...", "plan": "..."}
+    # Përditëso last_used_at
+    db.table("api_keys").update(
+        {"last_used_at": datetime.now(timezone.utc).isoformat()}
+    ).eq("id", result.data["id"]).execute()
 
-
-# ── Main Webhook Endpoint ──────────────────────────────────────────────────
-@router.post("/webhooks/events")
-async def receive_event(
-    event:    WebhookEvent,
-    customer: dict = Depends(validate_api_key)
-):
-    """
-    Merr event nga SDK dhe e ruan në Supabase.
-    
-    Flow:
-    1. Valido API key        ✅
-    2. Gjej ose krijo agent  ✅
-    3. Ruaj metric           ✅
-    4. Kontrollo për alerts  ✅
-    5. Kthe konfirmim        ✅
-    """
-    db          = get_db()
-    customer_id = customer["id"]
-
-    # ── Step 1: Gjej ose Krijo Agent ──────────────────────────────────────
-    agent = _get_or_create_agent(
-        db          = db,
-        agent_name  = event.agentId,
-        customer_id = customer_id
-    )
-    agent_id = agent["id"]
-
-    # ── Step 2: Ruaj Metric në Supabase ───────────────────────────────────
-    metric_data = {
-        "agent_id":      agent_id,
-        "customer_id":   customer_id,
-        "success":       event.success,
-        "latency_ms":    event.latency,
-        "cost_usd":      event.cost,
-        "tokens_input":  event.tokensInput  or 0,
-        "tokens_output": event.tokensOutput or 0,
-        "error_message": event.errorMessage,
-        "error_type":    event.errorType,
-        "task_type":     event.taskType,
-        "user_rating":   event.userRating,
-        "timestamp":     event.timestamp,
-    }
-
-    db.table("metrics").insert(metric_data).execute()
-
-    # ── Step 3: Kontrollo për Alerts (async) ──────────────────────────────
-    await check_and_create_alerts(
-        db          = db,
-        agent_id    = agent_id,
-        customer_id = customer_id,
-        event       = event
-    )
-
-    return {
-        "status":  "ok",
-        "message": "✅ Event u regjistrua me sukses",
-        "agentId": agent_id
-    }
+    return result.data
 
 
-# ── Helper: Get or Create Agent ───────────────────────────────────────────
-def _get_or_create_agent(db, agent_name: str, customer_id: str) -> dict:
-    """
-    Nëse agent ekziston → ktheje.
-    Nëse nuk ekziston → krijoje automatikisht.
-    """
-    result = (
+async def _get_or_create_agent(org_id: str, agent_name: str) -> str:
+    """Kthe agent_id ekzistues ose krijo të ri."""
+    db = get_db()
+
+    # Kërko ekzistues
+    existing = (
         db.table("agents")
-        .select("id, name")
-        .eq("customer_id", customer_id)
+        .select("id")
+        .eq("org_id", org_id)
         .eq("name", agent_name)
+        .single()
         .execute()
     )
 
-    if result.data:
-        return result.data[0]
+    if existing.data:
+        return existing.data["id"]
 
-    # Krijo agent të ri automatikisht
+    # Krijo të ri
     new_agent = (
         db.table("agents")
         .insert({
-            "name":        agent_name,
-            "customer_id": customer_id,
-            "status":      "active"
+            "org_id": org_id,
+            "name": agent_name,
+            "status": "active",
+            "created_at": datetime.now(timezone.utc).isoformat()
         })
         .execute()
     )
-    return new_agent.data[0]
+
+    return new_agent.data[0]["id"]
+
+
+@router.post("/events", response_model=WebhookResponse)
+async def receive_event(
+    event: WebhookEvent,
+    authorization: Optional[str] = Header(None)
+):
+    """
+    Merr një event nga SDK dhe e ruan si agent_run.
+    Headers: Authorization: Bearer ok_live_xxx
+    """
+    # Auth
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+
+    raw_key = authorization.replace("Bearer ", "").strip()
+    api_key_data = await _validate_api_key(raw_key)
+    org_id = api_key_data["org_id"]
+
+    # Gjej ose krijo agent
+    agent_id = await _get_or_create_agent(org_id, event.agent_name)
+
+    # Vendos timestamp
+    run_time = event.timestamp or datetime.now(timezone.utc).isoformat()
+
+    # Ruan run në agent_runs
+    db = get_db()
+    run_result = db.table("agent_runs").insert({
+        "agent_id":      agent_id,
+        "org_id":        org_id,
+        "status":        event.status,           # 'success' | 'error' | 'timeout' | 'running'
+        "latency_ms":    event.latency_ms,
+        "input_tokens":  event.input_tokens,     # ← input_tokens (jo tokens_input)
+        "output_tokens": event.output_tokens,    # ← output_tokens (jo tokens_output)
+        "cost_usd":      event.cost_usd,
+        "error_message": event.error_message,
+        "error_type":    event.error_type,
+        "trace_id":      event.trace_id,
+        "session_id":    event.session_id,
+        "metadata":      event.metadata,
+        "started_at":    event.started_at or run_time,
+        "ended_at":      event.ended_at or run_time,
+        "created_at":    run_time,
+    }).execute()
+
+    run_id = run_result.data[0]["id"] if run_result.data else None
+
+    # Check alerts async (non-blocking)
+    asyncio.create_task(
+        check_and_create_alerts(agent_id, org_id, event)
+    )
+
+    return WebhookResponse(
+        status="ok",
+        message="Event received and stored",
+        agent_id=agent_id,
+        run_id=run_id
+    )
